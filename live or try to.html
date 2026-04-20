@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Terminal Deadzone - Cinematic Edition</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', monospace; }
+        #hud { position: absolute; bottom: 20px; left: 20px; color: #00ffcc; font-size: 1.2rem; z-index: 10; text-shadow: 2px 2px #000; pointer-events: none; display: none; }
+        #infection-container { width: 200px; height: 10px; background: #222; border: 1px solid #555; margin-top: 5px; }
+        #infection-bar { width: 0%; height: 100%; background: #00ff00; }
+        #crosshair { position: absolute; top: 50%; left: 50%; width: 14px; height: 14px; border: 2px solid #00ffcc; border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; z-index: 5; display: none; }
+        #dialogue-box { position: absolute; bottom: 10%; left: 50%; transform: translateX(-50%); width: 70%; background: rgba(0,0,0,0.9); border: 2px solid #00ffcc; color: white; padding: 20px; font-size: 1.5rem; text-align: center; z-index: 100; display: none; }
+        #overlay-msg { position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; background: #000; color: #00ffcc; cursor: pointer; z-index: 200; text-align: center; }
+        #msg-popup { position: absolute; top: 20%; left: 50%; transform: translate(-50%, -50%); color: #00ffff; font-size: 2rem; font-weight: bold; display: none; text-shadow: 0 0 10px #00ffff; text-align: center; }
+    </style>
+</head>
+<body>
+    <div id="overlay-msg"><h1>[ SYSTEM BOOT: CLICK TO START ]</h1></div>
+    <div id="msg-popup"></div>
+    <div id="dialogue-box"><div id="dialogue-text"></div><div style="font-size:0.8rem; color:#00ffcc; margin-top:10px;">[PRESS E TO CONTINUE]</div></div>
+    <div id="hud">
+        SQUAD: <span id="squad-count">9</span> | <span id="item-label">KEYS</span>: <span id="score" style="color:yellow">0</span>/<span id="max-score">5</span><br>
+        INFECTION: <div id="infection-container"><div id="infection-bar"></div></div>
+    </div>
+    <div id="crosshair"></div>
+
+    <script type="importmap"> { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } } </script>
+    <script type="module">
+        import * as THREE from 'three';
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 3000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        document.body.appendChild(renderer.domElement);
+
+        // --- AUDIO SETUP ---
+        const listener = new THREE.AudioListener();
+        camera.add(listener);
+
+        const smackSound = new THREE.Audio(listener);
+        const walkSound = new THREE.Audio(listener);
+        const bgMusic = new THREE.Audio(listener);
+        const audioLoader = new THREE.AudioLoader();
+
+        audioLoader.load('PM_ROCKCrsh_Designed_Rock_Impact_Carsh_Big_Cinematic_43_PMSFX_RI2_3888.mp3', (buffer) => {
+            smackSound.setBuffer(buffer);
+            smackSound.setVolume(0.5); // Lowered so it doesn't drown others out
+        });
+
+        audioLoader.load('zapsplat_foley_footsteps_heavy_shoes_boots_walking_wooden_floor_83707.mp3', (buffer) => {
+            walkSound.setBuffer(buffer);
+            walkSound.setLoop(true);
+            walkSound.setVolume(1.0); // Maxed for better audibility
+        });
+
+        audioLoader.load('music_zapsplat_the_rise_of_the_zombies_886252.mp3', (buffer) => {
+            bgMusic.setBuffer(buffer);
+            bgMusic.setLoop(true);
+            bgMusic.setVolume(0.35); // Set to ~35%
+        });
+
+        const STATE_INTRO = 0, STATE_AMBUSH = 1, STATE_FACTORY = 2, STATE_MEADOW_2 = 3, STATE_AIRPORT = 4, STATE_ENDING = 5;
+        let gameState = STATE_INTRO;
+        let stats = { items: 0, maxItems: 5, infection: 0, aliveCount: 9 };
+        const CELL = 80;
+        const collidables = [], enemies = [], survivors = [], items = [], neons = [], decals = [];
+
+        function createDecalTex(type) {
+            const cvs = document.createElement('canvas'); cvs.width = 256; cvs.height = 256;
+            const x = cvs.getContext('2d');
+            if(type === 'blood') {
+                x.fillStyle = 'rgba(139, 0, 0, 0.85)';
+                for(let i=0; i<15; i++) { x.beginPath(); x.arc(128+(Math.random()-0.5)*150, 128+(Math.random()-0.5)*150, Math.random()*30, 0, Math.PI*2); x.fill(); }
+            } else if(type === 'scratch') {
+                x.strokeStyle = 'rgba(10, 10, 10, 0.9)'; x.lineWidth = 6; x.lineCap = 'round';
+                for(let i=0; i<4; i++) { x.beginPath(); x.moveTo(50+i*40, 20); x.lineTo(30+i*40+Math.random()*20, 200); x.stroke(); }
+            } else if(type === 'help') {
+                x.fillStyle = 'rgba(200, 200, 200, 0.8)'; x.font = 'bold 80px Courier'; x.fillText("HELP", 20, 100); x.fillText("RUN", 60, 200);
+            } else if(type === 'plane') {
+                x.fillStyle = 'black'; x.font = 'bold 150px Arial'; x.fillText("✈", 50, 180);
+            }
+            const tex = new THREE.CanvasTexture(cvs); tex.transparent = true; return tex;
+        }
+        const texBlood = createDecalTex('blood'), texScratch = createDecalTex('scratch'), texHelp = createDecalTex('help'), texPlane = createDecalTex('plane');
+
+        function addDecal(px, py, pz, rotY, tex, size=40) {
+            const m = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ 
+                map: tex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1 
+            }));
+            let nudge = 0.8; let fX = px, fY = py, fZ = pz;
+            if (rotY === 0) fZ += (CELL/2 + nudge);
+            else if (rotY === Math.PI) fZ -= (CELL/2 + nudge);
+            else if (rotY === Math.PI/2) fX += (CELL/2 + nudge);
+            else if (rotY === -Math.PI/2) fX -= (CELL/2 + nudge);
+            else if (py <= 1) fY = 0.5;
+            m.position.set(fX, fY, fZ); m.rotation.y = rotY; scene.add(m); decals.push(m);
+        }
+
+        const canvas = document.createElement('canvas'); canvas.width = 128; canvas.height = 128;
+        const ctx = canvas.getContext('2d'); ctx.fillStyle = '#222'; ctx.fillRect(0,0,128,128); ctx.strokeStyle = '#444'; ctx.lineWidth = 6; ctx.strokeRect(0,0,128,128); 
+        const floorTex = new THREE.CanvasTexture(canvas); floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
+
+        const ambient = new THREE.AmbientLight(0xffffff, 0.1); scene.add(ambient);
+        const playerLight = new THREE.SpotLight(0xffffff, 8000, 1200, 0.7, 0.4);
+        camera.add(playerLight); playerLight.target.position.set(0, 0, -1); camera.add(playerLight.target); scene.add(camera);
+
+        const weaponGroup = new THREE.Group();
+        const batMesh = new THREE.Mesh(new THREE.CylinderGeometry(1.6, 1.0, 24, 12), new THREE.MeshStandardMaterial({ color: 0x553311 }));
+        batMesh.rotation.x = Math.PI / 2; weaponGroup.add(batMesh); weaponGroup.position.set(16, -14, -28); camera.add(weaponGroup);
+
+        const factoryWallMat = new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 0.05, metalness: 0.9 });
+        const factoryFloorMat = new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9, metalness: 0.1 });
+        const airportWallMat = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.1, metalness: 0.5 });
+        const airportFloorMat = new THREE.MeshStandardMaterial({ color: 0x113366, roughness: 0.2, metalness: 0.8 });
+
+        const meadowFloor = new THREE.Mesh(new THREE.PlaneGeometry(3000, 3000), new THREE.MeshStandardMaterial({ color: 0x2d5a27 }));
+        meadowFloor.rotation.x = -Math.PI/2; scene.add(meadowFloor); scene.background = new THREE.Color(0x6699ff);
+
+        let activeGate = new THREE.Mesh(new THREE.BoxGeometry(CELL, 100, 20), new THREE.MeshStandardMaterial({ color: 0x3d2616 }));
+        activeGate.position.set(0, 50, -150); scene.add(activeGate);
+        const skyWinZone = new THREE.Mesh(new THREE.PlaneGeometry(CELL, 100), new THREE.MeshBasicMaterial({ color: 0x6699ff }));
+        skyWinZone.position.set(0, 50, -160); scene.add(skyWinZone);
+
+        const levelMap = [
+            [1,1,1,1,1,1,1,1,1,1], [1,5,0,0,0,1,0,3,0,1], [1,0,1,1,0,1,0,1,0,1], [1,0,1,3,0,0,0,1,3,1], 
+            [1,0,1,2,1,1,2,1,2,1], [1,0,0,0,3,0,3,0,0,1], [1,1,1,0,1,1,0,1,1,1], [1,3,2,0,1,4,0,1,2,3],
+            [1,2,2,0,1,2,0,1,2,2], [1,1,1,1,1,1,1,1,1,1]
+        ];
+
+        let diagStep = 0;
+        let currentDialogs = [{ n: "JACK", t: "Where are you going with that bat?" }, { n: "YOU", t: "I'm off to play baseball." }, { n: "BEN", t: "Whos that there...?" }];
+        const endLvl1Dialogs = [{ n: "JACK", t: "We're alive... I don't believe it." }, { n: "JIM", t: "Next time... we should all get bats." }, { n: "LAKE", t: "Guysss... where are the others?" }];
+        const airportIntroDialogs = [{ n: "JACK", t: "Hey guys look, I found a note..." }, { n: "JACK", t: "'Dear squad, the 6 of us entered the airport...'" }, { n: "JACK", t: "'...2 others took a plane to Chicago, but the rest of us are still here.'" }, { n: "JACK", t: "'There is one plane left which has 6 seats, but it needs 6 fuel canisters.'" }, { n: "JACK", t: "'Meet us in the cafeteria. - Zack'" }, { n: "YOU", t: "Alright. Let's find that fuel." }];
+
+        function showDialogue() {
+            bgMusic.setVolume(0.05);
+            document.getElementById('dialogue-box').style.display = 'block';
+            document.getElementById('dialogue-text').innerHTML = `<strong>${currentDialogs[diagStep].n}:</strong> ${currentDialogs[diagStep].t}`;
+        }
+
+        function clearEnvironment() {
+            collidables.forEach(c => scene.remove(c)); collidables.length = 0;
+            enemies.forEach(z => scene.remove(z)); enemies.length = 0;
+            items.forEach(i => scene.remove(i)); items.length = 0;
+            neons.forEach(n => scene.remove(n)); neons.length = 0;
+            decals.forEach(d => scene.remove(d)); decals.length = 0;
+        }
+
+        function spawnSquad(n) {
+            survivors.forEach(s => scene.remove(s)); survivors.length = 0;
+            for(let i=0; i<n; i++) {
+                const s = new THREE.Group(); s.add(new THREE.Mesh(new THREE.CapsuleGeometry(2.5, 6), new THREE.MeshStandardMaterial({ color: 0x0066ff })));
+                s.position.set((Math.random()-0.5)*80, 8, (Math.random()-0.5)*40 + 40); scene.add(s); survivors.push(s);
+            }
+        }
+        spawnSquad(9);
+
+        function loadLevel(isAirport) {
+            gameState = isAirport ? STATE_AIRPORT : STATE_FACTORY;
+            scene.background = new THREE.Color(0x000000); scene.fog = new THREE.FogExp2(0x000000, 0.0025); meadowFloor.visible = false;
+            stats.items = 0; stats.maxItems = isAirport ? 6 : 5;
+            document.getElementById('item-label').innerText = isAirport ? "FUEL" : "KEYS";
+            document.getElementById('max-score').innerText = stats.maxItems;
+            clearEnvironment(); spawnSquad(3);
+
+            levelMap.forEach((row, z) => {
+                row.forEach((cell, x) => {
+                    const px = x * CELL, pz = z * CELL;
+                    const fTile = new THREE.Mesh(new THREE.PlaneGeometry(CELL, CELL), isAirport ? airportFloorMat : factoryFloorMat);
+                    fTile.rotation.x = -Math.PI/2; fTile.position.set(px, 0, pz); scene.add(fTile);
+                    if (cell === 1) {
+                        const m = new THREE.Mesh(new THREE.BoxGeometry(CELL, 200, CELL), isAirport ? airportWallMat : factoryWallMat);
+                        m.position.set(px, 100, pz); scene.add(m); collidables.push(m);
+                    } else if (cell === 3 || (isAirport && cell === 4)) {
+                        const k = new THREE.Group();
+                        const km = isAirport ? new THREE.Mesh(new THREE.CylinderGeometry(3, 3, 10), new THREE.MeshStandardMaterial({ color: 0xff0000 })) 
+                                             : new THREE.Mesh(new THREE.TorusGeometry(4, 1.2), new THREE.MeshStandardMaterial({ color: 0xffff00 }));
+                        k.add(km); k.position.set(px, 12, pz); scene.add(k); items.push(k);
+                        if(Math.random() > 0.4) addDecal(px, 0.1, pz, -Math.PI/2, texBlood, 50);
+                    } else if (cell === 0 || cell === 5) {
+                        const l = new THREE.PointLight(isAirport ? 0xffffff : 0x00ffff, isAirport ? 400 : 300, 300);
+                        l.position.set(px, 85, pz); scene.add(l); neons.push(l);
+                        if(cell === 0 && Math.random() > 0.8) {
+                            const zb = new THREE.Mesh(new THREE.BoxGeometry(12, 22, 12), new THREE.MeshStandardMaterial({ color: 0x33ff33 }));
+                            zb.position.set(px, 11, pz); zb.userData = { down: 0, alerted: false }; scene.add(zb); enemies.push(zb);
+                        }
+                        if(cell === 5) { camera.position.set(px, 15, pz); activeGate.position.set(px, 50, pz + 40); skyWinZone.position.set(px, 50, pz + 45); }
+                    }
+                });
+            });
+
+            if(!isAirport) { 
+                addDecal(1*CELL, 40, 2*CELL, 0, texHelp); addDecal(3*CELL, 30, 2*CELL, 0, texScratch); 
+            } else { 
+                addDecal(1*CELL, 30, 2*CELL, 0, texBlood, 60); addDecal(4*CELL, 40, 4*CELL, Math.PI, texBlood, 80);
+                const plane = new THREE.Mesh(new THREE.CylinderGeometry(15, 15, 100), new THREE.MeshStandardMaterial({color:0xffffff}));
+                plane.rotation.z = Math.PI/2; plane.position.set(1*CELL, 15, 7*CELL); scene.add(plane); collidables.push(plane);
+            }
+            document.getElementById('msg-popup').innerText = isAirport ? "AIRPORT TERMINAL" : "YOU GOT SEPERATED";
+            document.getElementById('msg-popup').style.display = 'block'; setTimeout(() => document.getElementById('msg-popup').style.display = 'none', 3000);
+            document.getElementById('hud').style.display = 'block'; document.getElementById('crosshair').style.display = 'block';
+        }
+
+        function loadMeadow2() {
+            gameState = STATE_MEADOW_2; clearEnvironment(); scene.background = new THREE.Color(0x88bbff); scene.fog = null; meadowFloor.visible = true;
+            camera.position.set(0, 15, 60); camera.rotation.set(0,0,0);
+            activeGate.material = new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.8 });
+            activeGate.position.set(0, 50, -150); skyWinZone.position.set(0, 50, -160);
+            addDecal(0, 50, -148, 0, texPlane, 60); spawnSquad(3);
+            diagStep = 0; currentDialogs = endLvl1Dialogs; showDialogue(); document.exitPointerLock();
+        }
+
+        let keys = {}, vel = new THREE.Vector3(), prevT = performance.now();
+        document.addEventListener('keyup', (e) => keys[e.code] = false);
+        document.addEventListener('mousemove', (e) => { if(document.pointerLockElement) { camera.rotation.y -= e.movementX*0.002; camera.rotation.x -= e.movementY*0.002; } });
+        
+        document.addEventListener('keydown', (e) => {
+            if(e.code === 'KeyE') {
+                if(gameState === STATE_INTRO || gameState === STATE_MEADOW_2) {
+                    diagStep++; 
+                    if(diagStep < currentDialogs.length) showDialogue();
+                    else {
+                        bgMusic.setVolume(0.35);
+                        document.getElementById('dialogue-box').style.display = 'none';
+                        if(gameState === STATE_INTRO) {
+                            gameState = STATE_AMBUSH; 
+                            for(let i=0; i<7; i++) {
+                                const zb = new THREE.Mesh(new THREE.BoxGeometry(12, 22, 12), new THREE.MeshStandardMaterial({ color: 0x33ff33 }));
+                                zb.position.set((Math.random()-0.5)*300, 11, 400 + Math.random()*100); zb.userData = { down: 0, alerted: true }; scene.add(zb); enemies.push(zb);
+                            }
+                        } else { 
+                            document.body.requestPointerLock(); 
+                            if(currentDialogs === endLvl1Dialogs) { currentDialogs = airportIntroDialogs; diagStep = 0; showDialogue(); } 
+                        }
+                    }
+                } else {
+                    items.forEach((it, i) => { if(camera.position.distanceTo(it.position) < 60) { stats.items++; scene.remove(it); items.splice(i,1); document.getElementById('score').innerText = stats.items; if(stats.items >= stats.maxItems) activeGate.position.y += 110; } });
+                }
+            }
+            keys[e.code] = true;
+        });
+
+        document.addEventListener('mousedown', () => {
+            if(document.pointerLockElement && (gameState === STATE_FACTORY || gameState === STATE_AIRPORT)) {
+                weaponGroup.rotation.x = -1.2; setTimeout(()=>weaponGroup.rotation.x=0, 150);
+                if (smackSound.buffer) { if (smackSound.isPlaying) smackSound.stop(); smackSound.play(); }
+                const r = new THREE.Raycaster(); r.setFromCamera(new THREE.Vector2(0,0), camera);
+                const h = r.intersectObjects(enemies); if(h.length > 0 && h[0].distance < 85) { h[0].object.userData.down = 2400; h[0].object.rotation.x = Math.PI/2; }
+            }
+        });
+
+        document.getElementById('overlay-msg').addEventListener('click', () => { 
+            document.body.requestPointerLock(); 
+            document.getElementById('overlay-msg').style.display = 'none'; 
+            if(diagStep===0) showDialogue(); 
+            if (!bgMusic.isPlaying) bgMusic.play();
+        });
+
+        function animate() {
+            requestAnimationFrame(animate); 
+            const delta = Math.min((performance.now() - prevT)/1000, 0.1);
+            
+            if(document.pointerLockElement) {
+                vel.x -= vel.x*10*delta; vel.z -= vel.z*10*delta;
+                const isMoving = keys['KeyW'] || keys['KeyS'] || keys['KeyA'] || keys['KeyD'];
+                const s = keys['ShiftLeft'] ? 2200 : 1100;
+
+                if(keys['KeyW']) vel.z -= s*delta; if(keys['KeyS']) vel.z += s*delta;
+                if(keys['KeyA']) vel.x -= s*delta; if(keys['KeyD']) vel.x += s*delta;
+                
+                const op = camera.position.clone(); 
+                camera.translateX(vel.x*delta); camera.translateZ(vel.z*delta); 
+
+                // --- ADJUSTED BOBBING & FOOTSTEPS ---
+                if (isMoving) {
+                    const bobSpeed = keys['ShiftLeft'] ? 12 : 8; 
+                    const bobAmount = keys['ShiftLeft'] ? 0.5 : 0.3; // Increased visibility
+                    camera.position.y = 15 + Math.sin(performance.now() * 0.001 * bobSpeed) * bobAmount;
+
+                    if (!walkSound.isPlaying) walkSound.play();
+                    if (walkSound.context.currentTime - walkSound._startTime > 2) {
+                        walkSound.stop(); walkSound.play();
+                    }
+                } else {
+                    camera.position.y = THREE.MathUtils.lerp(camera.position.y, 15, 0.1);
+                    if (walkSound.isPlaying) walkSound.stop();
+                }
+
+                if(gameState === STATE_FACTORY || gameState === STATE_AIRPORT) {
+                    collidables.forEach(c => { if(new THREE.Box3().setFromObject(camera).intersectsBox(new THREE.Box3().setFromObject(c))) camera.position.copy(op); });
+                    if(stats.items >= stats.maxItems && camera.position.distanceTo(skyWinZone.position) < 45) { if(gameState === STATE_FACTORY) loadMeadow2(); else location.reload(); }
+                } else if(gameState === STATE_AMBUSH && camera.position.distanceTo(activeGate.position) < 55) loadLevel(false);
+                else if(gameState === STATE_MEADOW_2 && camera.position.distanceTo(activeGate.position) < 55) loadLevel(true);
+
+                enemies.forEach(z => {
+                    const d = camera.position.distanceTo(z.position); if(d < 200) z.userData.alerted = true;
+                    if(z.userData.down <= 0 && z.userData.alerted) {
+                        z.position.add(new THREE.Vector3().subVectors(camera.position, z.position).normalize().multiplyScalar(20*delta));
+                        if(d < 28) stats.infection += 0.5;
+                    } else if(z.userData.down > 0) { z.userData.down--; if(z.userData.down <= 0) { z.rotation.x = 0; z.position.y = 11; } }
+                });
+                survivors.forEach(sv => { if(sv.position.distanceTo(camera.position) > 45) sv.position.add(new THREE.Vector3().subVectors(camera.position, sv.position).normalize().multiplyScalar(15*delta)); sv.lookAt(camera.position.x, 8, camera.position.z); });
+            }
+
+            neons.forEach(n => { if(Math.random() > 0.98) n.intensity = 300 + Math.random()*500; });
+            items.forEach(it => { it.rotation.y += 0.05; it.position.y = 12 + Math.sin(performance.now()*0.005)*3; });
+            renderer.render(scene, camera); 
+            prevT = performance.now();
+            document.getElementById('infection-bar').style.width = stats.infection + "%"; 
+            if(stats.infection >= 100) location.reload();
+        }
+        camera.position.set(0, 15, 60); camera.rotation.order = 'YXZ'; animate();
+    </script>
+</body>
+</html>
